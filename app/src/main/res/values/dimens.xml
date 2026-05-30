@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="toc_padding_top">90dp</dimen>     <!-- match height of top bar -->
+    <dimen name="toc_padding_bottom">100dp</dimen> <!-- match height of playback controls -->
+</resources>

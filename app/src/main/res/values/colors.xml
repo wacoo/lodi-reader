@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Top / Playback -->
+    <color name="topControlsBackground">#E0E0E0</color>
+
+    <!-- Buttons -->
+    <color name="playButtonColor">#4CAF50</color>
+    <color name="pauseButtonColor">#FF9800</color>
+    <color name="rewindButtonColor">#2196F3</color>
+    <color name="closeButtonColor">#EF5350</color>
+
+    <!-- Text -->
+    <color name="primaryText">#333333</color>
+    <color name="secondaryText">#666666</color>
+
+    <!-- App -->
+    <color name="appBackground">#F5F5F7</color>
+
+    <!-- Defaults -->
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <color name="linkColor">#0000EE</color> <!-- classic blue link -->
+
+</resources>

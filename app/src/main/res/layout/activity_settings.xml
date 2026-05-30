@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    style="@style/AppContainer"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:padding="20dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!-- Timer -->
+        <TextView
+            android:id="@+id/timerLabel"
+            android:text="Timer"
+            style="@style/SettingsLabel"/>
+        <SeekBar
+            android:id="@+id/seekTimer"
+            android:max="120"
+            style="@style/SettingsSeekBar"/>
+
+        <!-- Fade -->
+        <TextView
+            android:id="@+id/fadeLabel"
+            android:text="Fade"
+            style="@style/SettingsLabel"/>
+        <SeekBar
+            android:id="@+id/seekFade"
+            android:max="60"
+            style="@style/SettingsSeekBar"/>
+
+        <!-- Shake -->
+        <TextView
+            android:id="@+id/shakeLabel"
+            android:text="Shake"
+            style="@style/SettingsLabel"/>
+        <SeekBar
+            android:id="@+id/seekShake"
+            android:max="30"
+            style="@style/SettingsSeekBar"/>
+
+        <!-- Font Size -->
+        <TextView
+            android:id="@+id/fontLabel"
+            android:text="Font Size"
+            style="@style/SettingsLabel"/>
+        <SeekBar
+            android:id="@+id/seekFont"
+            android:max="40"
+            style="@style/SettingsSeekBar"/>
+
+        <!-- Paper Color -->
+        <TextView
+            android:id="@+id/colorLabel"
+            android:text="Paper Color"
+            style="@style/SettingsLabel"/>
+        <Spinner
+            android:id="@+id/colorSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"/>
+
+        <!-- Preview -->
+        <TextView
+            android:id="@+id/previewText"
+            android:text="Sample text preview"
+            android:textColor="@color/primaryText"
+            android:padding="16dp"
+            android:gravity="center"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="16dp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"/>
+
+        <!-- Reset -->
+        <Button
+            android:id="@+id/resetBtn"
+            android:text="Reset to Defaults"
+            style="@style/PrimaryButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"/>
+
+    </LinearLayout>
+</ScrollView>

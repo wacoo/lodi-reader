@@ -10,6 +10,7 @@ public class SettingsManager {
     private static final String KEY_TIMER = "timer_ms";
     private static final String KEY_FADE = "fade_ms";
     private static final String KEY_SHAKE = "shake_intensity";
+    private static final String KEY_TIMER_ENABLED = "timer_enabled";
     private static final String KEY_FONT_SIZE = "font_size";
     private static final String KEY_PAPER_COLOR = "paper_color";
     private static final String KEY_FONT_COLOR = "font_color";
@@ -28,21 +29,28 @@ public class SettingsManager {
     public String getLastOpenedBookUri() {
         return prefs.getString(KEY_LAST_BOOK, null);
     }
-    // Save last read sentence index for a specific book
+    
     public void setLastReadSentenceIndex(String bookUri, int index) {
         prefs.edit().putInt(KEY_LAST_SENTENCE_PREFIX + bookUri, index).apply();
     }
 
-    // Retrieve last read sentence index for a specific book
     public int getLastReadSentenceIndex(String bookUri) {
-        return prefs.getInt(KEY_LAST_SENTENCE_PREFIX + bookUri, 0); // default 0
+        return prefs.getInt(KEY_LAST_SENTENCE_PREFIX + bookUri, 0);
     }
+
     // ===== TIMER =====
     public long getTimerMs() {
         return prefs.getLong(KEY_TIMER, 60 * 1000);
     }
     public void setTimerMs(long value) {
         prefs.edit().putLong(KEY_TIMER, value).apply();
+    }
+    
+    public boolean isTimerEnabled() {
+        return prefs.getBoolean(KEY_TIMER_ENABLED, true);
+    }
+    public void setTimerEnabled(boolean enabled) {
+        prefs.edit().putBoolean(KEY_TIMER_ENABLED, enabled).apply();
     }
 
     // ===== FADE =====
@@ -71,7 +79,7 @@ public class SettingsManager {
 
     // ===== PAPER COLOR =====
     public int getPaperColor() {
-        return prefs.getInt(KEY_PAPER_COLOR, 0xFFFFFFFF); // default white
+        return prefs.getInt(KEY_PAPER_COLOR, 0xFFFFFFFF);
     }
     public void setPaperColor(int value) {
         prefs.edit().putInt(KEY_PAPER_COLOR, value).apply();
@@ -79,7 +87,7 @@ public class SettingsManager {
 
     // ===== FONT COLOR =====
     public int getFontColor() {
-        return prefs.getInt(KEY_FONT_COLOR, 0xFF000000); // default black
+        return prefs.getInt(KEY_FONT_COLOR, 0xFF000000);
     }
     public void setFontColor(int value) {
         prefs.edit().putInt(KEY_FONT_COLOR, value).apply();

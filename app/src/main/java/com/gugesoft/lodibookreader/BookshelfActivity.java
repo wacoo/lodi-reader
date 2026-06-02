@@ -11,6 +11,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class BookshelfActivity extends AppCompatActivity {
@@ -19,7 +20,7 @@ public class BookshelfActivity extends AppCompatActivity {
     private BookAdapter adapter;
     private BookRepository bookRepo;
     private ExtendedFloatingActionButton deleteButton;
-    private List<BookItem> books;
+    private final List<BookItem> books = new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -30,8 +31,7 @@ public class BookshelfActivity extends AppCompatActivity {
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
 
         bookRepo = new BookRepository(this);
-        books = bookRepo.getBooks();
-
+        
         adapter = new BookAdapter(books, book -> {
             stopCurrentReadingSession();
             Intent intent = new Intent(this, MainActivity.class);
@@ -53,7 +53,6 @@ public class BookshelfActivity extends AppCompatActivity {
             adapter.notifyDataSetChanged();
         });
 
-        // Show delete button when selection mode is active
         adapter.setOnSelectionModeChange(active -> {
             if (active) {
                 deleteButton.show();
@@ -61,6 +60,20 @@ public class BookshelfActivity extends AppCompatActivity {
                 deleteButton.hide();
             }
         });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshBooks();
+    }
+
+    private void refreshBooks() {
+        books.clear();
+        books.addAll(bookRepo.getBooks());
+        if (adapter != null) {
+            adapter.notifyDataSetChanged();
+        }
     }
 
     private void stopCurrentReadingSession() {

@@ -33,7 +33,7 @@ import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final int PICK_BOOK_REQUEST = 1;
+    private static final int PICK_REQUEST = 1;
     private static final int WORDS_PER_PAGE = 250;
 
     private SettingsManager settings;
@@ -45,6 +45,9 @@ public class MainActivity extends AppCompatActivity {
     private ShakeDetector shakeDetector;
     private BookRepository bookRepo;
     private String currentBookUri;
+    private String currentBookTitle;
+    private String currentBookAuthor;
+    private String currentBookCoverUri;
 
     private MaterialButton timerToggleButton;
     private CardView bottomControls;
@@ -212,11 +215,42 @@ public class MainActivity extends AppCompatActivity {
                     .addToBackStack(null).commit();
         });
 
-        String uriFromShelf = getIntent().getStringExtra("BOOK_URI");
-        String bookUriToLoad = (uriFromShelf != null) ? uriFromShelf : settings.getLastOpenedBookUri();
-        if (bookUriToLoad != null) loadBookFromUri(Uri.parse(bookUriToLoad));
+        handleIntent(getIntent());
 
         applyAppearance();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
+    }
+
+    private void handleIntent(Intent intent) {
+        if (intent == null) return;
+        
+        // Check for VIEW intent (opening from file manager)
+        if (Intent.ACTION_VIEW.equals(intent.getAction())) {
+            Uri data = intent.getData();
+            if (data != null) {
+                try {
+                    // Try to take persistable permission if it's a content URI
+                    if (ContentResolver.SCHEME_CONTENT.equals(data.getScheme())) {
+                        getContentResolver().takePersistableUriPermission(data, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    }
+                } catch (Exception e) {
+                    Log.e("MainActivity", "Failed to take persistable permission", e);
+                }
+                loadBookFromUri(data);
+                return;
+            }
+        }
+
+        // Check for URI passed from bookshelf
+        String uriFromShelf = intent.getStringExtra("BOOK_URI");
+        String bookUriToLoad = (uriFromShelf != null) ? uriFromShelf : settings.getLastOpenedBookUri();
+        if (bookUriToLoad != null) loadBookFromUri(Uri.parse(bookUriToLoad));
     }
 
     private void playAtPosition(int position) {
@@ -269,6 +303,9 @@ public class MainActivity extends AppCompatActivity {
                 BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, uri);
                 runOnUiThread(() -> {
                     if (meta == null || meta.sentences == null || meta.sentences.isEmpty()) return;
+                    currentBookTitle = meta.title;
+                    currentBookAuthor = meta.author;
+                    currentBookCoverUri = meta.coverUri;
                     sentences.clear();
                     sentences.addAll(meta.sentences);
                     currentToc.clear();
@@ -281,8 +318,13 @@ public class MainActivity extends AppCompatActivity {
                     
                     int startIndex = settings.getLastReadSentenceIndex(currentBookUri);
                     updateProgressBar(startIndex);
+
+                    // Add/Update book in repository with cover image
+                    int currentPage = (sentenceToPage != null && startIndex < sentenceToPage.length) ? sentenceToPage[startIndex] : 0;
+                    BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, startIndex, totalPages, currentPage);
+                    bookRepo.saveOrUpdateBook(bookItem);
                     
-                    BookDataHolder.getInstance().replaceData(sentences, currentToc, meta.title, meta.author);
+                    BookDataHolder.getInstance().replaceData(sentences, currentToc, currentBookTitle, currentBookAuthor);
                     Intent serviceIntent = new Intent(this, ReadingService.class);
                     serviceIntent.setAction(ReadingService.ACTION_LOAD);
                     serviceIntent.putExtra("INDEX", startIndex);
@@ -335,10 +377,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateProgressBar(int sentenceIndex) {
-        if (!isUserSeeking && sentenceToPage != null && sentenceIndex < sentenceToPage.length) {
+        if (sentenceToPage != null && sentenceIndex < sentenceToPage.length) {
             int page = sentenceToPage[sentenceIndex];
-            seekBarProgress.setProgress(page);
-            tvPageCounter.setText(String.format(Locale.getDefault(), "Page %d / %d", page + 1, totalPages));
+            if (!isUserSeeking) {
+                seekBarProgress.setProgress(page);
+                tvPageCounter.setText(String.format(Locale.getDefault(), "Page %d / %d", page + 1, totalPages));
+            }
+            
+            // Periodically update repository with progress
+            if (currentBookUri != null && currentBookTitle != null) {
+                BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, sentenceIndex, totalPages, page);
+                bookRepo.saveOrUpdateBook(bookItem);
+            }
         }
     }
 
@@ -377,13 +427,13 @@ public class MainActivity extends AppCompatActivity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/plain", "application/epub+zip"});
-        startActivityForResult(intent, PICK_BOOK_REQUEST);
+        startActivityForResult(intent, PICK_REQUEST);
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == PICK_BOOK_REQUEST && resultCode == RESULT_OK && data != null) {
+        if (requestCode == PICK_REQUEST && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
                 getContentResolver().takePersistableUriPermission(uri, data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION));

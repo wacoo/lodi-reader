@@ -25,7 +25,8 @@ public class BookRepository {
     public List<BookItem> getBooks() {
         String json = prefs.getString(KEY_BOOKS, "[]");
         Type type = new TypeToken<List<BookItem>>() {}.getType();
-        return gson.fromJson(json, type);
+        List<BookItem> books = gson.fromJson(json, type);
+        return books != null ? books : new ArrayList<>();
     }
 
     public void saveBooks(List<BookItem> books) {
@@ -34,20 +35,24 @@ public class BookRepository {
 
     public void saveOrUpdateBook(BookItem item) {
         List<BookItem> books = getBooks();
+        boolean found = false;
 
         for (BookItem b : books) {
             if (b.uri.equals(item.uri)) {
-                // Update all fields
                 b.title = item.title;
                 b.author = item.author;
-                b.coverUri = item.coverUri;
+                if (item.coverUri != null) b.coverUri = item.coverUri;
                 b.lastSentenceIndex = item.lastSentenceIndex;
-                saveBooks(books);
-                return;
+                b.totalPages = item.totalPages;
+                b.currentPage = item.currentPage;
+                found = true;
+                break;
             }
         }
 
-        books.add(item);
+        if (!found) {
+            books.add(item);
+        }
         saveBooks(books);
     }
 
@@ -57,10 +62,10 @@ public class BookRepository {
         }
         return null;
     }
+    
     public void deleteBook(BookItem item) {
         List<BookItem> books = getBooks();
         books.removeIf(b -> b.uri.equals(item.uri));
         saveBooks(books);
     }
-
 }

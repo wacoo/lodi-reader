@@ -12,12 +12,20 @@ import android.widget.TextView;
 
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 public class BookAdapter extends RecyclerView.Adapter<BookAdapter.ViewHolder> {
+
+    private static final int[] COLORS = {
+            0xFFF44336, 0xFFE91E63, 0xFF9C27B0, 0xFF673AB7,
+            0xFF3F51B5, 0xFF2196F3, 0xFF03A9F4, 0xFF009688,
+            0xFF4CAF50, 0xFF8BC34A, 0xFFFF9800, 0xFFFF5722
+    };
 
     private List<BookItem> books;
     private OnBookClickListener listener;
@@ -55,21 +63,34 @@ public class BookAdapter extends RecyclerView.Adapter<BookAdapter.ViewHolder> {
 
         holder.tvTitle.setText(book.title);
         holder.tvAuthor.setText(book.author.isEmpty() ? "Unknown Author" : book.author);
-        holder.tvProgress.setText("Stopped at sentence " + book.lastSentenceIndex);
+        
+        if (book.totalPages > 0) {
+            holder.tvProgress.setText(String.format(Locale.getDefault(), "Page %d of %d", book.currentPage + 1, book.totalPages));
+        } else {
+            holder.tvProgress.setText("Not started");
+        }
 
+        // Try to load cover if available, otherwise show initials
+        boolean coverLoaded = false;
         if (book.coverUri != null && !book.coverUri.isEmpty()) {
             try {
-                Bitmap bitmap = BitmapFactory.decodeFile(Uri.parse(book.coverUri).getPath());
-                if (bitmap != null) {
-                    holder.ivCover.setImageBitmap(bitmap);
-                    holder.tvInitials.setVisibility(View.GONE);
-                } else {
-                    showInitials(holder, book);
+                Uri uri = Uri.parse(book.coverUri);
+                File imgFile = new File(uri.getPath());
+                if (imgFile.exists()) {
+                    Bitmap bitmap = BitmapFactory.decodeFile(imgFile.getAbsolutePath());
+                    if (bitmap != null) {
+                        holder.ivCover.setImageBitmap(bitmap);
+                        holder.ivCover.setVisibility(View.VISIBLE);
+                        holder.tvInitials.setVisibility(View.GONE);
+                        coverLoaded = true;
+                    }
                 }
             } catch (Exception e) {
-                showInitials(holder, book);
+                e.printStackTrace();
             }
-        } else {
+        }
+
+        if (!coverLoaded) {
             showInitials(holder, book);
         }
 
@@ -96,10 +117,14 @@ public class BookAdapter extends RecyclerView.Adapter<BookAdapter.ViewHolder> {
     }
 
     private void showInitials(ViewHolder holder, BookItem book) {
-        holder.ivCover.setImageDrawable(null);
+        holder.ivCover.setVisibility(View.GONE);
         holder.tvInitials.setVisibility(View.VISIBLE);
+        
         String initials = getInitials(book.title);
         holder.tvInitials.setText(initials);
+        
+        int colorIndex = Math.abs(book.title.hashCode()) % COLORS.length;
+        holder.tvInitials.setBackgroundColor(COLORS[colorIndex]);
     }
 
     private String getInitials(String title) {

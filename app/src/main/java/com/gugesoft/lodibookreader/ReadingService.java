@@ -213,7 +213,7 @@ public class ReadingService extends Service {
         isLoading = true;
         new Thread(() -> {
             try {
-                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, Uri.parse(currentBookUri));
+                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, Uri.parse(currentBookUri), null);
                 if (meta != null && meta.sentences != null && !meta.sentences.isEmpty()) {
                     BookDataHolder.getInstance().replaceData(meta.sentences, meta.toc, meta.title, meta.author);
                     ttsPlayer.loadSentences(meta.sentences);

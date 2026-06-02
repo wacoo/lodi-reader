@@ -30,6 +30,10 @@ import nl.siegmann.epublib.epub.EpubReader;
 
 public class BookLoader {
 
+    public interface OnProgressListener {
+        void onProgress(int current, int total, String message);
+    }
+
     public static class TOCItem {
         public final String title;
         public final String href;
@@ -56,16 +60,17 @@ public class BookLoader {
         }
     }
 
-    public BookMetadata loadBookWithMetadata(Context context, Uri uri) {
+    public BookMetadata loadBookWithMetadata(Context context, Uri uri, OnProgressListener listener) {
         String mimeType = context.getContentResolver().getType(uri);
 
         try (InputStream is = context.getContentResolver().openInputStream(uri)) {
             if (is == null) return new BookMetadata("Error Opening", "", null, null, null);
 
             if ("text/plain".equals(mimeType) || (uri.getPath() != null && uri.getPath().toLowerCase().endsWith(".txt"))) {
+                if (listener != null) listener.onProgress(0, 1, "Loading text file...");
                 return new BookMetadata("TXT Book", "", null, loadTxt(is), null);
             } else {
-                return loadEpubWithMetadata(context, is);
+                return loadEpubWithMetadata(context, is, listener);
             }
         } catch (Exception e) {
             Log.e("BookLoader", "Load error", e);
@@ -84,7 +89,7 @@ public class BookLoader {
         return sentences;
     }
 
-    private BookMetadata loadEpubWithMetadata(Context context, InputStream is) {
+    private BookMetadata loadEpubWithMetadata(Context context, InputStream is, OnProgressListener listener) {
         List<Sentence> allSentences = new ArrayList<>();
         List<TOCItem> tocItems = new ArrayList<>();
         String title = "Unknown Book";
@@ -92,6 +97,7 @@ public class BookLoader {
         String coverUri = null;
 
         try {
+            if (listener != null) listener.onProgress(0, 100, "Reading EPUB structure...");
             Book book = new EpubReader().readEpub(is);
             if (!book.getMetadata().getTitles().isEmpty()) title = book.getMetadata().getTitles().get(0);
             if (!book.getMetadata().getAuthors().isEmpty()) author = book.getMetadata().getAuthors().get(0).toString();
@@ -104,7 +110,8 @@ public class BookLoader {
             if (coverRes == null) {
                 for (Resource res : book.getResources().getAll()) {
                     String href = res.getHref().toLowerCase();
-                    if (href.contains("cover") && (href.endsWith(".jpg") || href.endsWith(".png"))) {
+                    if ((href.contains("cover") || href.contains("front")) && 
+                        (href.endsWith(".jpg") || href.endsWith(".jpeg") || href.endsWith(".png") || href.endsWith(".webp"))) {
                         coverRes = res;
                         break;
                     }
@@ -115,9 +122,18 @@ public class BookLoader {
                 if (bmp != null) coverUri = saveCoverToCache(context, bmp, title);
             }
 
-            for (SpineReference spine : book.getSpine().getSpineReferences()) {
+            List<SpineReference> spineReferences = book.getSpine().getSpineReferences();
+            int totalChapters = spineReferences.size();
+            
+            for (int i = 0; i < totalChapters; i++) {
+                SpineReference spine = spineReferences.get(i);
                 Resource resource = spine.getResource();
                 String resourceHref = resource.getHref();
+                
+                if (listener != null) {
+                    listener.onProgress(i, totalChapters, "Processing chapter " + (i + 1) + " of " + totalChapters);
+                }
+                
                 String html = readResource(resource);
                 allSentences.addAll(processHtmlIntoSentences(html, resourceHref, allSentences.size()));
             }

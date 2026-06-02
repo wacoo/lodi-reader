@@ -12,6 +12,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -56,6 +57,12 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvPageCounter;
     private LinearLayout topBar;
     private FloatingActionButton playPauseFab;
+    
+    // Loading UI
+    private View loadingOverlay;
+    private ProgressBar progressBarLoading;
+    private TextView tvLoadingMessage;
+
     private boolean isTimerEnabled = true;
     private boolean isPlaying = false;
     private boolean isUserSeeking = false;
@@ -136,6 +143,10 @@ public class MainActivity extends AppCompatActivity {
         topBar = findViewById(R.id.topBar);
         timerToggleButton = findViewById(R.id.timerToggleButton);
         recyclerView = findViewById(R.id.recyclerView);
+        
+        loadingOverlay = findViewById(R.id.loadingOverlay);
+        progressBarLoading = findViewById(R.id.progressBarLoading);
+        tvLoadingMessage = findViewById(R.id.tvLoadingMessage);
 
         timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
 
@@ -230,12 +241,10 @@ public class MainActivity extends AppCompatActivity {
     private void handleIntent(Intent intent) {
         if (intent == null) return;
         
-        // Check for VIEW intent (opening from file manager)
         if (Intent.ACTION_VIEW.equals(intent.getAction())) {
             Uri data = intent.getData();
             if (data != null) {
                 try {
-                    // Try to take persistable permission if it's a content URI
                     if (ContentResolver.SCHEME_CONTENT.equals(data.getScheme())) {
                         getContentResolver().takePersistableUriPermission(data, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                     }
@@ -247,7 +256,6 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // Check for URI passed from bookshelf
         String uriFromShelf = intent.getStringExtra("BOOK_URI");
         String bookUriToLoad = (uriFromShelf != null) ? uriFromShelf : settings.getLastOpenedBookUri();
         if (bookUriToLoad != null) loadBookFromUri(Uri.parse(bookUriToLoad));
@@ -295,14 +303,30 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadBookFromUri(Uri uri) {
-        Toast.makeText(this, "Loading book...", Toast.LENGTH_SHORT).show();
+        runOnUiThread(() -> {
+            loadingOverlay.setVisibility(View.VISIBLE);
+            progressBarLoading.setProgress(0);
+            tvLoadingMessage.setText("Preparing to load...");
+        });
+        
         settings.setLastOpenedBookUri(uri.toString());
         new Thread(() -> {
             try {
                 currentBookUri = uri.toString();
-                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, uri);
+                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, uri, (current, total, message) -> {
+                    runOnUiThread(() -> {
+                        progressBarLoading.setMax(total);
+                        progressBarLoading.setProgress(current);
+                        tvLoadingMessage.setText(message);
+                    });
+                });
+                
                 runOnUiThread(() -> {
-                    if (meta == null || meta.sentences == null || meta.sentences.isEmpty()) return;
+                    loadingOverlay.setVisibility(View.GONE);
+                    if (meta == null || meta.sentences == null || meta.sentences.isEmpty()) {
+                        Toast.makeText(this, "Failed to load book", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
                     currentBookTitle = meta.title;
                     currentBookAuthor = meta.author;
                     currentBookCoverUri = meta.coverUri;
@@ -319,7 +343,6 @@ public class MainActivity extends AppCompatActivity {
                     int startIndex = settings.getLastReadSentenceIndex(currentBookUri);
                     updateProgressBar(startIndex);
 
-                    // Add/Update book in repository with cover image
                     int currentPage = (sentenceToPage != null && startIndex < sentenceToPage.length) ? sentenceToPage[startIndex] : 0;
                     BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, startIndex, totalPages, currentPage);
                     bookRepo.saveOrUpdateBook(bookItem);
@@ -336,7 +359,13 @@ public class MainActivity extends AppCompatActivity {
                     adapter.setHighlighted(startIndex);
                     recyclerView.scrollToPosition(startIndex);
                 });
-            } catch (Exception e) { Log.e("MainActivity", "Error", e); }
+            } catch (Exception e) { 
+                Log.e("MainActivity", "Error", e);
+                runOnUiThread(() -> {
+                    loadingOverlay.setVisibility(View.GONE);
+                    Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                });
+            }
         }).start();
     }
 
@@ -384,7 +413,6 @@ public class MainActivity extends AppCompatActivity {
                 tvPageCounter.setText(String.format(Locale.getDefault(), "Page %d / %d", page + 1, totalPages));
             }
             
-            // Periodically update repository with progress
             if (currentBookUri != null && currentBookTitle != null) {
                 BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, sentenceIndex, totalPages, page);
                 bookRepo.saveOrUpdateBook(bookItem);

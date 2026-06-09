@@ -17,6 +17,7 @@ public class SettingsManager {
     private static final String KEY_FONT_FAMILY = "font_family";
     private static final String KEY_LAST_BOOK = "last_book_uri";
     private static final String KEY_LAST_SENTENCE_PREFIX = "last_sentence_";
+    private static final String KEY_LAST_CHAPTER_PREFIX = "last_chapter_";
     private SharedPreferences prefs;
 
     public SettingsManager(Context context) {
@@ -36,6 +37,14 @@ public class SettingsManager {
 
     public int getLastReadSentenceIndex(String bookUri) {
         return prefs.getInt(KEY_LAST_SENTENCE_PREFIX + bookUri, 0);
+    }
+
+    public void setLastReadChapterIndex(String bookUri, int index) {
+        prefs.edit().putInt(KEY_LAST_CHAPTER_PREFIX + bookUri, index).apply();
+    }
+
+    public int getLastReadChapterIndex(String bookUri) {
+        return prefs.getInt(KEY_LAST_CHAPTER_PREFIX + bookUri, 0);
     }
 
     // ===== TIMER =====

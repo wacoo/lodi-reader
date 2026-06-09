@@ -1,7 +1,6 @@
 package com.gugesoft.lodibookreader;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
@@ -12,118 +11,75 @@ public class VolumeController {
     private final AudioManager audioManager;
     private final Context context;
     
-    // Static state to persist across service restarts within the same process
-    private static int originalVolume = -1;
-    private static int lastSetAutoVolume = -1;
-    private static long lastAutoSetTime = 0;
+    private int baselineVolume = -1;
+    private int lastSetAutoVolume = -1;
+    private long lastAutoSetTime = 0;
     
-    private static final long AUTO_CHANGE_COOLDOWN_MS = 5000; // 5 seconds to be safe from system lag
-    private static final String PREF_NAME = "VolumeControllerPrefs";
-    private static final String KEY_BASELINE = "baseline_volume";
+    private static final long AUTO_CHANGE_COOLDOWN_MS = 1000; 
 
     public VolumeController(Context context) {
         this.context = context.getApplicationContext();
         audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        
-        if (originalVolume == -1) {
-            SharedPreferences prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-            originalVolume = prefs.getInt(KEY_BASELINE, -1);
-            Log.d(TAG, "Loaded baseline from prefs: " + originalVolume);
-        }
-        
-        // Ensure we don't immediately adopt current volume on cold boot if we have a saved one
-        if (lastAutoSetTime == 0) {
-            lastAutoSetTime = System.currentTimeMillis();
-        }
     }
 
-    private void saveBaseline(int volume) {
-        if (volume <= 1) return; // Never adopt near-zero as a baseline
-        
-        // If we already have a baseline, only adopt a new one if it's significantly different 
-        // OR if we haven't set an auto volume recently.
-        originalVolume = volume;
-        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-                .edit().putInt(KEY_BASELINE, volume).apply();
-        Log.d(TAG, "New baseline volume saved: " + volume);
+    public synchronized void setBaselineVolume(int volume) {
+        if (volume < 0) return;
+        this.baselineVolume = volume;
+        Log.d(TAG, "Baseline volume (Original) set to: " + volume);
     }
 
     /**
-     * Adopts the current system volume as the new baseline if it was adjusted manually.
+     * Detects if the volume was changed manually.
      */
-    public synchronized void updateBaselineIfManual() {
+    public synchronized void handlePossibleManualChange() {
         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        if (current <= 1) return;
-
         long now = System.currentTimeMillis();
-        long timeSinceAuto = now - lastAutoSetTime;
         
-        if (timeSinceAuto < AUTO_CHANGE_COOLDOWN_MS) {
-            // During auto-period, only adopt if user moved it significantly AWAY from our target.
-            // If they moved it TOWARDS zero, we might be fading, so be careful.
-            if (lastSetAutoVolume != -1 && Math.abs(current - lastSetAutoVolume) > 2) {
-                saveBaseline(current);
-                Log.d(TAG, "Manual override detected during auto-period. New baseline: " + current);
+        // If we recently set the volume automatically (e.g. during a fade)
+        if (now - lastAutoSetTime < AUTO_CHANGE_COOLDOWN_MS) {
+            // Check if the current volume differs from what we just set.
+            // If it does, the user manually adjusted it.
+            if (lastSetAutoVolume != -1 && current != lastSetAutoVolume) {
+                setBaselineVolume(current);
+                Log.d(TAG, "Manual change detected during fade. New baseline: " + current);
             }
         } else {
-            // Idle state. Adopting change as baseline if it's different.
-            if (originalVolume == -1 || current != originalVolume) {
-                saveBaseline(current);
+            // Outside of automated changes, any difference from our baseline is manual.
+            if (baselineVolume != -1 && current != baselineVolume) {
+                setBaselineVolume(current);
+                Log.d(TAG, "Manual change detected. New baseline: " + current);
             }
         }
     }
 
-    public synchronized void captureBaselineVolume() {
+    public synchronized void captureInitialVolume() {
         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        long timeSinceAuto = System.currentTimeMillis() - lastAutoSetTime;
-        
-        // Only capture if we are not currently faded (timeSinceAuto > cooldown)
-        // OR if current volume is higher than our recorded baseline.
-        if (current > 1) {
-            if (timeSinceAuto > AUTO_CHANGE_COOLDOWN_MS || current > originalVolume || originalVolume == -1) {
-                saveBaseline(current);
-                Log.d(TAG, "Captured baseline volume: " + current);
-            }
-        }
+        setBaselineVolume(current);
+        lastSetAutoVolume = current;
     }
 
     public synchronized void applyFade(long remainingMs, long totalFadeDurationMs) {
-        // Check for manual changes before applying next fade step
-        updateBaselineIfManual();
-        
-        if (originalVolume <= 0) {
-            originalVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 2;
-        }
+        if (baselineVolume <= 0) return;
         
         double ratio = (double) remainingMs / totalFadeDurationMs;
-        int target = (int) Math.ceil((double) originalVolume * ratio);
-        target = Math.max(0, Math.min(target, originalVolume));
+        int target = (int) Math.round((double) baselineVolume * ratio);
+        target = Math.max(0, Math.min(target, baselineVolume));
 
         int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
         
-        // Update intent tracking
-        lastSetAutoVolume = target;
-        lastAutoSetTime = System.currentTimeMillis();
-
         if (target != current) {
+            lastSetAutoVolume = target;
+            lastAutoSetTime = System.currentTimeMillis();
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
         }
     }
 
     public synchronized void restoreVolume() {
-        // IMPORTANT: In handleShake, we call restoreVolume.
-        // We must ensure originalVolume is actually a valid "normal" volume.
-        
-        if (originalVolume > 0) {
-            int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            
-            Log.d(TAG, "Restoring volume to baseline: " + originalVolume + " (current: " + current + ")");
-            
-            // Set first, update tracking last
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, originalVolume, 0);
-            
-            lastSetAutoVolume = originalVolume;
+        if (baselineVolume >= 0) {
+            lastSetAutoVolume = baselineVolume;
             lastAutoSetTime = System.currentTimeMillis();
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, baselineVolume, 0);
+            Log.d(TAG, "Volume restored to baseline: " + baselineVolume);
         }
     }
 
@@ -131,12 +87,12 @@ public class VolumeController {
         try {
             AudioAttributes aa = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .build();
-            
-            MediaPlayer mp = MediaPlayer.create(context, R.raw.bell, aa, audioManager.generateAudioSessionId());
+
+            MediaPlayer mp = MediaPlayer.create(context, R.raw.bell);
             if (mp != null) {
-                mp.setVolume(1.0f, 1.0f);
+                mp.setAudioAttributes(aa);
                 mp.start();
                 mp.setOnCompletionListener(MediaPlayer::release);
             }

@@ -48,7 +48,7 @@ public class LodiStepTimer {
 
             if (remainingTimeMs <= 0) {
                 isRunning = false;
-                // Ensure volume is restored when timer finishes
+                // Ensure volume is restored to baseline when timer finishes
                 volumeController.restoreVolume();
                 if (onFinish != null) {
                     onFinish.run();
@@ -62,13 +62,10 @@ public class LodiStepTimer {
 
     public void start(long durationMs) {
         stop();
-
         this.remainingTimeMs = durationMs;
         this.isRunning = true;
-
-        // Capture user volume as baseline before any fade starts
-        volumeController.captureBaselineVolume();
-
+        // We no longer capture baseline here, it's managed by VolumeController
+        // based on app start and manual changes.
         handler.post(timerRunnable);
     }
 
@@ -80,7 +77,6 @@ public class LodiStepTimer {
         // Reset timer to the configured reset time
         remainingTimeMs = resetTimeMs;
 
-        // Immediate UI feedback
         if (listener != null) {
             listener.onTick(remainingTimeMs);
         }
@@ -93,10 +89,12 @@ public class LodiStepTimer {
     }
 
     public void stop() {
-        isRunning = false;
-        handler.removeCallbacksAndMessages(null);
-        // Ensure volume is back to normal when timer is stopped/disabled
-        volumeController.restoreVolume();
+        if (isRunning) {
+            isRunning = false;
+            handler.removeCallbacksAndMessages(null);
+            // Ensure volume is back to baseline when timer is stopped
+            volumeController.restoreVolume();
+        }
     }
 
     public boolean isRunning() {

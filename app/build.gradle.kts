@@ -23,6 +23,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
@@ -32,7 +33,6 @@ android {
 }
 
 dependencies {
-
     implementation(libs.epublib.core) {
         exclude(group = "xmlpull", module = "xmlpull")
     }
@@ -41,13 +41,17 @@ dependencies {
     implementation(libs.material)
     implementation(libs.activity)
     implementation(libs.constraintlayout)
-
-    // ADD THIS:
     implementation(libs.recyclerview)
     implementation(libs.androidx.media)
     implementation(libs.firebase.crashlytics.buildtools)
+    implementation(libs.google.gson)
+
+    // Room
+    implementation(libs.room.runtime)
+    // Use the string syntax for annotationProcessor in KTS
+    "annotationProcessor"(libs.room.compiler)
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
-    implementation(libs.google.gson)
 }

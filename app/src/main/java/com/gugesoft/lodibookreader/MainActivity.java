@@ -7,8 +7,6 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.PowerManager;
-import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.widget.LinearLayout;
@@ -31,24 +29,22 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
-
+    private static final String TAG = "MainActivity";
     private static final int PICK_REQUEST = 1;
-    private static final int WORDS_PER_PAGE = 250;
 
     private SettingsManager settings;
     private RecyclerView recyclerView;
     private SentenceAdapter adapter;
-    private final List<Sentence> sentences = new ArrayList<>();
+    private final List<Sentence> currentSentences = new ArrayList<>();
     private final List<BookLoader.TOCItem> currentToc = new ArrayList<>();
 
     private ShakeDetector shakeDetector;
-    private BookRepository bookRepo;
     private String currentBookUri;
-    private String currentBookTitle;
-    private String currentBookAuthor;
-    private String currentBookCoverUri;
+    private int currentChapterIndex = -1;
 
     private MaterialButton timerToggleButton;
     private CardView bottomControls;
@@ -58,19 +54,14 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout topBar;
     private FloatingActionButton playPauseFab;
     
-    // Loading UI
     private View loadingOverlay;
     private ProgressBar progressBarLoading;
     private TextView tvLoadingMessage;
 
     private boolean isTimerEnabled = true;
     private boolean isPlaying = false;
-    private boolean isUserSeeking = false;
-
-    // Page mapping data
-    private int[] sentenceToPage;
-    private int[] pageToFirstSentenceIndex;
-    private int totalPages = 0;
+    private AppDatabase db;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private final BroadcastReceiver serviceUpdateReceiver = new BroadcastReceiver() {
         @Override
@@ -81,11 +72,22 @@ public class MainActivity extends AppCompatActivity {
             switch (action) {
                 case ReadingService.ACTION_UPDATE_UI:
                     int index = intent.getIntExtra("INDEX", -1);
-                    if (index != -1) {
+                    int chapterIdx = intent.getIntExtra("CHAPTER_INDEX", -1);
+                    int totalChapters = intent.getIntExtra("TOTAL_CHAPTERS", 0);
+                    
+                    runOnUiThread(() -> {
+                        if (totalChapters > 0) {
+                            tvPageCounter.setText(String.format(Locale.getDefault(), "Chapter %d / %d", chapterIdx + 1, totalChapters));
+                        }
+                    });
+
+                    if (chapterIdx != -1 && (chapterIdx != currentChapterIndex || currentSentences.isEmpty())) {
+                        loadChapterFromDb(chapterIdx, index);
+                    } else if (index != -1) {
                         runOnUiThread(() -> {
                             adapter.setHighlighted(index);
                             recyclerView.scrollToPosition(index);
-                            updateProgressBar(index);
+                            hideLoading();
                         });
                     }
                     break;
@@ -107,127 +109,29 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
-    private void updatePlayState(boolean playing) {
-        this.isPlaying = playing;
-        if (playPauseFab != null) {
-            playPauseFab.setImageResource(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
-        }
-        if (!playing) {
-            timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
-        }
-    }
-
-    private void sendServiceCommand(String action) {
-        Intent intent = new Intent(this, ReadingService.class);
-        intent.setAction(action);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
-        }
-    }
-
-    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
-        settings = new SettingsManager(this);
-        bookRepo = new BookRepository(this);
-        isTimerEnabled = settings.isTimerEnabled();
-
-        bottomControls = findViewById(R.id.bottomControls);
-        seekContainer = findViewById(R.id.seekContainer);
-        seekBarProgress = findViewById(R.id.seekBarProgress);
-        tvPageCounter = findViewById(R.id.tvPageCounter);
-        topBar = findViewById(R.id.topBar);
-        timerToggleButton = findViewById(R.id.timerToggleButton);
-        recyclerView = findViewById(R.id.recyclerView);
         
-        loadingOverlay = findViewById(R.id.loadingOverlay);
-        progressBarLoading = findViewById(R.id.progressBarLoading);
-        tvLoadingMessage = findViewById(R.id.tvLoadingMessage);
-
-        timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
-
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(ReadingService.ACTION_UPDATE_UI);
-        filter.addAction(ReadingService.ACTION_PLAY);
-        filter.addAction(ReadingService.ACTION_PAUSE);
-        filter.addAction(ReadingService.ACTION_CLOSE);
-        filter.addAction(ReadingService.ACTION_TIMER_TICK);
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(serviceUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(serviceUpdateReceiver, filter);
+        if (!isTaskRoot() && getIntent().hasCategory(Intent.CATEGORY_LAUNCHER) && Intent.ACTION_MAIN.equals(getIntent().getAction())) {
+            finish();
+            return;
         }
 
+        setContentView(R.layout.activity_main);
+        settings = new SettingsManager(this);
+        db = AppDatabase.getInstance(this);
+        isTimerEnabled = settings.isTimerEnabled();
+
+        initUi();
+        setupReceiver();
         requestPermissions();
-
-        recyclerView.setLayoutManager(new LinearLayoutManager(this));
-        adapter = new SentenceAdapter(sentences, new SentenceAdapter.OnSentenceClickListener() {
-            @Override
-            public void onSentenceClick(int position) {
-                playAtPosition(position);
-            }
-
-            @Override public void onNavigateTo(int position) { recyclerView.scrollToPosition(position); }
-            @Override public void onSingleTap() {
-                if (topBar.getVisibility() == View.VISIBLE) hideControls();
-                else showControls();
-            }
-        }, settings);
-        recyclerView.setAdapter(adapter);
 
         shakeDetector = new ShakeDetector(this, settings.getShakeIntensity(), () -> {
             if (isTimerEnabled && isPlaying) sendServiceCommand(ReadingService.ACTION_SHAKE);
         });
 
-        findViewById(R.id.loadBookBtn).setOnClickListener(v -> pickBook());
-        findViewById(R.id.openShelfBtn).setOnClickListener(v -> startActivity(new Intent(this, BookshelfActivity.class)));
-        findViewById(R.id.openSettingsBtn).setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
-
-        timerToggleButton.setOnClickListener(v -> {
-            isTimerEnabled = !isTimerEnabled;
-            settings.setTimerEnabled(isTimerEnabled);
-            timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
-        });
-
-        playPauseFab = findViewById(R.id.playPauseFab);
-        playPauseFab.setOnClickListener(v -> sendServiceCommand(isPlaying ? ReadingService.ACTION_PAUSE : ReadingService.ACTION_PLAY));
-        findViewById(R.id.rewindFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_REWIND));
-        findViewById(R.id.forwardFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_FORWARD));
-        findViewById(R.id.closeFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_CLOSE));
-
-        seekBarProgress.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) {
-                    tvPageCounter.setText(String.format(Locale.getDefault(), "Page %d / %d", progress + 1, totalPages));
-                }
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) { isUserSeeking = true; }
-            @Override public void onStopTrackingTouch(SeekBar seekBar) {
-                isUserSeeking = false;
-                int page = seekBar.getProgress();
-                if (pageToFirstSentenceIndex != null && page < pageToFirstSentenceIndex.length) {
-                    playAtPosition(pageToFirstSentenceIndex[page]);
-                }
-            }
-        });
-
-        findViewById(R.id.openTocBtn).setOnClickListener(v -> {
-            getSupportFragmentManager().beginTransaction()
-                    .replace(R.id.rootLayout, new TableOfContentsFragment(currentToc, sentences, index -> {
-                        playAtPosition(index);
-                        getSupportFragmentManager().popBackStack();
-                    }))
-                    .addToBackStack(null).commit();
-        });
-
         handleIntent(getIntent());
-
         applyAppearance();
     }
 
@@ -238,223 +142,204 @@ public class MainActivity extends AppCompatActivity {
         handleIntent(intent);
     }
 
+    private void initUi() {
+        bottomControls = findViewById(R.id.bottomControls);
+        seekContainer = findViewById(R.id.seekContainer);
+        seekBarProgress = findViewById(R.id.seekBarProgress);
+        tvPageCounter = findViewById(R.id.tvPageCounter);
+        topBar = findViewById(R.id.topBar);
+        timerToggleButton = findViewById(R.id.timerToggleButton);
+        recyclerView = findViewById(R.id.recyclerView);
+        loadingOverlay = findViewById(R.id.loadingOverlay);
+        progressBarLoading = findViewById(R.id.progressBarLoading);
+        tvLoadingMessage = findViewById(R.id.tvLoadingMessage);
+
+        timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
+        recyclerView.setLayoutManager(new LinearLayoutManager(this));
+        adapter = new SentenceAdapter(currentSentences, new SentenceAdapter.OnSentenceClickListener() {
+            @Override public void onSentenceClick(int position) { playAtPosition(position); }
+            @Override public void onNavigateTo(int position) { recyclerView.scrollToPosition(position); }
+            @Override public void onSingleTap() {
+                if (topBar.getVisibility() == View.VISIBLE) hideControls(); else showControls();
+            }
+        }, settings);
+        recyclerView.setAdapter(adapter);
+
+        findViewById(R.id.loadBookBtn).setOnClickListener(v -> pickBook());
+        findViewById(R.id.openShelfBtn).setOnClickListener(v -> startActivity(new Intent(this, BookshelfActivity.class)));
+        findViewById(R.id.openSettingsBtn).setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
+        timerToggleButton.setOnClickListener(v -> {
+            isTimerEnabled = !isTimerEnabled;
+            settings.setTimerEnabled(isTimerEnabled);
+            timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
+            sendServiceCommand(ReadingService.ACTION_TOGGLE_TIMER);
+        });
+
+        playPauseFab = findViewById(R.id.playPauseFab);
+        playPauseFab.setOnClickListener(v -> sendServiceCommand(isPlaying ? ReadingService.ACTION_PAUSE : ReadingService.ACTION_PLAY));
+        findViewById(R.id.rewindFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_REWIND));
+        findViewById(R.id.forwardFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_FORWARD));
+        findViewById(R.id.closeFab).setOnClickListener(v -> sendServiceCommand(ReadingService.ACTION_CLOSE));
+
+        findViewById(R.id.openTocBtn).setOnClickListener(v -> {
+            getSupportFragmentManager().beginTransaction()
+                    .replace(R.id.rootLayout, new TableOfContentsFragment(currentToc, chapterIndex -> {
+                        loadChapterAndPlay(chapterIndex, 0);
+                        getSupportFragmentManager().popBackStack();
+                    }))
+                    .addToBackStack(null).commit();
+        });
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void setupReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ReadingService.ACTION_UPDATE_UI);
+        filter.addAction(ReadingService.ACTION_PLAY);
+        filter.addAction(ReadingService.ACTION_PAUSE);
+        filter.addAction(ReadingService.ACTION_CLOSE);
+        filter.addAction(ReadingService.ACTION_TIMER_TICK);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(serviceUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(serviceUpdateReceiver, filter);
+        }
+    }
+
     private void handleIntent(Intent intent) {
         if (intent == null) return;
-        
-        if (Intent.ACTION_VIEW.equals(intent.getAction())) {
-            Uri data = intent.getData();
-            if (data != null) {
-                try {
-                    if (ContentResolver.SCHEME_CONTENT.equals(data.getScheme())) {
-                        getContentResolver().takePersistableUriPermission(data, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    }
-                } catch (Exception e) {
-                    Log.e("MainActivity", "Failed to take persistable permission", e);
-                }
-                loadBookFromUri(data);
-                return;
-            }
+        Uri uri = intent.getData();
+        if (uri == null) {
+            String uriStr = intent.getStringExtra("BOOK_URI");
+            if (uriStr == null) uriStr = settings.getLastOpenedBookUri();
+            if (uriStr != null) uri = Uri.parse(uriStr);
         }
-
-        String uriFromShelf = intent.getStringExtra("BOOK_URI");
-        String bookUriToLoad = (uriFromShelf != null) ? uriFromShelf : settings.getLastOpenedBookUri();
-        if (bookUriToLoad != null) loadBookFromUri(Uri.parse(bookUriToLoad));
+        if (uri != null) loadBookMetadata(uri);
     }
 
-    private void playAtPosition(int position) {
-        Intent intent = new Intent(MainActivity.this, ReadingService.class);
-        intent.setAction(ReadingService.ACTION_PLAY);
-        intent.putExtra("INDEX", position);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
-        }
-    }
+    private void loadBookMetadata(Uri uri) {
+        currentBookUri = uri.toString();
+        settings.setLastOpenedBookUri(currentBookUri);
+        showLoading("Loading book structure...");
 
-    private void requestPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                try {
-                    @SuppressLint("BatteryLife") Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                    intent.setData(Uri.parse("package:" + getPackageName()));
-                    startActivity(intent);
-                } catch (Exception ignored) {}
-            }
-        }
-        List<String> permissionsToRequest = new ArrayList<>();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT);
-            }
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-            permissionsToRequest.add(Manifest.permission.READ_PHONE_STATE);
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS);
-            }
-        }
-        if (!permissionsToRequest.isEmpty()) {
-            ActivityCompat.requestPermissions(this, permissionsToRequest.toArray(new String[0]), 100);
-        }
-    }
-
-    private void loadBookFromUri(Uri uri) {
-        runOnUiThread(() -> {
-            loadingOverlay.setVisibility(View.VISIBLE);
-            progressBarLoading.setProgress(0);
-            tvLoadingMessage.setText("Preparing to load...");
-        });
-        
-        settings.setLastOpenedBookUri(uri.toString());
-        new Thread(() -> {
+        executor.execute(() -> {
             try {
-                currentBookUri = uri.toString();
-                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, uri, (current, total, message) -> {
-                    runOnUiThread(() -> {
-                        progressBarLoading.setMax(total);
-                        progressBarLoading.setProgress(current);
-                        tvLoadingMessage.setText(message);
-                    });
-                });
-                
-                runOnUiThread(() -> {
-                    loadingOverlay.setVisibility(View.GONE);
-                    if (meta == null || meta.sentences == null || meta.sentences.isEmpty()) {
-                        Toast.makeText(this, "Failed to load book", Toast.LENGTH_SHORT).show();
-                        return;
-                    }
-                    currentBookTitle = meta.title;
-                    currentBookAuthor = meta.author;
-                    currentBookCoverUri = meta.coverUri;
-                    sentences.clear();
-                    sentences.addAll(meta.sentences);
-                    currentToc.clear();
-                    currentToc.addAll(meta.toc);
-                    
-                    calculatePages();
-                    
-                    adapter.notifyDataSetChanged();
-                    seekBarProgress.setMax(Math.max(0, totalPages - 1));
-                    
-                    int startIndex = settings.getLastReadSentenceIndex(currentBookUri);
-                    updateProgressBar(startIndex);
-
-                    int currentPage = (sentenceToPage != null && startIndex < sentenceToPage.length) ? sentenceToPage[startIndex] : 0;
-                    BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, startIndex, totalPages, currentPage);
-                    bookRepo.saveOrUpdateBook(bookItem);
-                    
-                    BookDataHolder.getInstance().replaceData(sentences, currentToc, currentBookTitle, currentBookAuthor);
-                    Intent serviceIntent = new Intent(this, ReadingService.class);
-                    serviceIntent.setAction(ReadingService.ACTION_LOAD);
-                    serviceIntent.putExtra("INDEX", startIndex);
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(serviceIntent);
+                BookEntity existing = db.bookDao().getBookByUri(currentBookUri);
+                if (existing == null) {
+                    BookLoader.BookInfo info = new BookLoader().extractBookInfo(this, uri);
+                    if (info != null) {
+                        BookEntity entity = new BookEntity(currentBookUri, info.title, info.author, info.coverUri);
+                        entity.totalPages = info.toc.size();
+                        db.bookDao().insertBook(entity);
+                        
+                        List<ChapterEntity> chapters = new ArrayList<>();
+                        for (int i = 0; i < info.toc.size(); i++) {
+                            BookLoader.TOCItem item = info.toc.get(i);
+                            chapters.add(new ChapterEntity(currentBookUri, item.chapterIndex, item.title, item.href));
+                        }
+                        db.bookDao().insertChapters(chapters);
+                        
+                        runOnUiThread(() -> {
+                            currentToc.clear();
+                            currentToc.addAll(info.toc);
+                            tvPageCounter.setText(String.format(Locale.getDefault(), "Chapter 1 / %d", info.toc.size()));
+                            loadChapterFromDb(0, 0);
+                        });
                     } else {
-                        startService(serviceIntent);
+                        runOnUiThread(() -> {
+                            hideLoading();
+                            Toast.makeText(this, "Failed to load book structure", Toast.LENGTH_SHORT).show();
+                        });
                     }
-                    adapter.setHighlighted(startIndex);
-                    recyclerView.scrollToPosition(startIndex);
-                });
-            } catch (Exception e) { 
-                Log.e("MainActivity", "Error", e);
-                runOnUiThread(() -> {
-                    loadingOverlay.setVisibility(View.GONE);
-                    Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                });
+                } else {
+                    List<ChapterEntity> chapters = db.bookDao().getChaptersForBook(currentBookUri);
+                    if (existing.totalPages == 0 && !chapters.isEmpty()) {
+                        existing.totalPages = chapters.size();
+                        db.bookDao().updateBook(existing);
+                    }
+                    runOnUiThread(() -> {
+                        currentToc.clear();
+                        for (ChapterEntity c : chapters) {
+                            currentToc.add(new BookLoader.TOCItem(c.title, c.href, c.index));
+                        }
+                        int lastChapter = settings.getLastReadChapterIndex(currentBookUri);
+                        int lastSent = settings.getLastReadSentenceIndex(currentBookUri);
+                        tvPageCounter.setText(String.format(Locale.getDefault(), "Chapter %d / %d", lastChapter + 1, chapters.size()));
+                        loadChapterFromDb(lastChapter, lastSent);
+                    });
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error loading metadata", e);
+                runOnUiThread(this::hideLoading);
             }
-        }).start();
+        });
     }
 
-    private void calculatePages() {
-        if (sentences.isEmpty()) {
-            totalPages = 0;
-            sentenceToPage = new int[0];
-            pageToFirstSentenceIndex = new int[0];
-            return;
-        }
-
-        sentenceToPage = new int[sentences.size()];
-        List<Integer> firstIndices = new ArrayList<>();
-        
-        int currentWordCount = 0;
-        int currentPage = 0;
-        firstIndices.add(0);
-
-        for (int i = 0; i < sentences.size(); i++) {
-            String text = sentences.get(i).getText();
-            int wordsInSentence = (text == null || text.isEmpty()) ? 0 : text.trim().split("\\s+").length;
-            
-            if (currentWordCount + wordsInSentence > WORDS_PER_PAGE && currentWordCount > 0) {
-                currentPage++;
-                firstIndices.add(i);
-                currentWordCount = wordsInSentence;
-            } else {
-                currentWordCount += wordsInSentence;
+    private void loadChapterFromDb(int chapterIndex, int sentenceIndex) {
+        executor.execute(() -> {
+            try {
+                List<SentenceEntity> entities = db.bookDao().getSentencesForChapter(currentBookUri, chapterIndex);
+                if (entities.isEmpty()) {
+                    runOnUiThread(() -> showLoading("Loading chapter contents..."));
+                    Intent intent = new Intent(this, ReadingService.class);
+                    intent.setAction(ReadingService.ACTION_LOAD);
+                    intent.putExtra("URI", currentBookUri);
+                    intent.putExtra("CHAPTER_INDEX", chapterIndex);
+                    intent.putExtra("SENTENCE_INDEX", sentenceIndex);
+                    startServiceCommand(intent);
+                } else {
+                    runOnUiThread(() -> {
+                        currentChapterIndex = chapterIndex;
+                        currentSentences.clear();
+                        for (SentenceEntity e : entities) {
+                            currentSentences.add(new Sentence(e.globalIndex, e.text, e.link, e.internalId));
+                        }
+                        adapter.notifyDataSetChanged();
+                        adapter.setHighlighted(sentenceIndex);
+                        recyclerView.scrollToPosition(sentenceIndex);
+                        hideLoading();
+                    });
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "DB error loading chapter", e);
+                runOnUiThread(this::hideLoading);
             }
-            sentenceToPage[i] = currentPage;
-        }
-        
-        totalPages = currentPage + 1;
-        pageToFirstSentenceIndex = new int[firstIndices.size()];
-        for (int i = 0; i < firstIndices.size(); i++) {
-            pageToFirstSentenceIndex[i] = firstIndices.get(i);
-        }
+        });
     }
 
-    private void updateProgressBar(int sentenceIndex) {
-        if (sentenceToPage != null && sentenceIndex < sentenceToPage.length) {
-            int page = sentenceToPage[sentenceIndex];
-            if (!isUserSeeking) {
-                seekBarProgress.setProgress(page);
-                tvPageCounter.setText(String.format(Locale.getDefault(), "Page %d / %d", page + 1, totalPages));
-            }
-            
-            if (currentBookUri != null && currentBookTitle != null) {
-                BookItem bookItem = new BookItem(currentBookUri, currentBookTitle, currentBookAuthor, currentBookCoverUri, sentenceIndex, totalPages, page);
-                bookRepo.saveOrUpdateBook(bookItem);
-            }
-        }
+    private void updatePlayState(boolean playing) {
+        this.isPlaying = playing;
+        runOnUiThread(() -> {
+            playPauseFab.setImageResource(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play);
+        });
     }
 
     private void updateTimerButtonText(long remainingMs) {
-        if (!isTimerEnabled) {
-            timerToggleButton.setText("Off");
-            return;
+        if (remainingMs <= 0) {
+            timerToggleButton.setText(isTimerEnabled ? "On" : "Off");
+        } else {
+            long seconds = (remainingMs / 1000) % 60;
+            long minutes = (remainingMs / (1000 * 60)) % 60;
+            timerToggleButton.setText(String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds));
         }
-        int minutes = (int) (remainingMs / 1000) / 60;
-        int seconds = (int) (remainingMs / 1000) % 60;
-        timerToggleButton.setText(String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds));
     }
 
     private void showControls() {
         topBar.setVisibility(View.VISIBLE);
         bottomControls.setVisibility(View.VISIBLE);
         seekContainer.setVisibility(View.VISIBLE);
-        timerToggleButton.setVisibility(View.VISIBLE);
     }
 
     private void hideControls() {
         topBar.setVisibility(View.GONE);
         bottomControls.setVisibility(View.GONE);
         seekContainer.setVisibility(View.GONE);
-        timerToggleButton.setVisibility(View.GONE);
-    }
-
-    private void applyAppearance() {
-        recyclerView.setBackgroundColor(settings.getPaperColor());
-        findViewById(R.id.rootLayout).setBackgroundColor(settings.getPaperColor());
-        adapter.notifyDataSetChanged();
     }
 
     private void pickBook() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/plain", "application/epub+zip"});
         startActivityForResult(intent, PICK_REQUEST);
     }
 
@@ -464,22 +349,81 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == PICK_REQUEST && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
-                getContentResolver().takePersistableUriPermission(uri, data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION));
-                loadBookFromUri(uri);
+                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                loadBookMetadata(uri);
             }
         }
     }
 
-    @Override protected void onResume() { 
-        super.onResume(); 
-        shakeDetector.start(); 
-        applyAppearance(); 
+    private void loadChapterAndPlay(int chapterIndex, int sentenceIndex) {
+        showLoading("Loading chapter...");
+        Intent intent = new Intent(this, ReadingService.class);
+        intent.setAction(ReadingService.ACTION_LOAD);
+        intent.putExtra("URI", currentBookUri);
+        intent.putExtra("CHAPTER_INDEX", chapterIndex);
+        intent.putExtra("SENTENCE_INDEX", sentenceIndex);
+        startServiceCommand(intent);
+    }
+
+    private void playAtPosition(int position) {
+        Intent intent = new Intent(this, ReadingService.class);
+        intent.setAction(ReadingService.ACTION_PLAY_AT);
+        intent.putExtra("INDEX", position);
+        startServiceCommand(intent);
+    }
+
+    private void sendServiceCommand(String action) {
+        Intent intent = new Intent(this, ReadingService.class);
+        intent.setAction(action);
+        startServiceCommand(intent);
+    }
+
+    private void startServiceCommand(Intent intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+    }
+
+    private void requestPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, 101);
+            }
+        }
+    }
+
+    private void applyAppearance() {
+        // App background, text sizes etc are managed via settings and styles
+    }
+
+    private void showLoading(String message) {
+        tvLoadingMessage.setText(message);
+        loadingOverlay.setVisibility(View.VISIBLE);
+    }
+
+    private void hideLoading() {
+        loadingOverlay.setVisibility(View.GONE);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (shakeDetector != null) shakeDetector.start();
         sendServiceCommand(ReadingService.ACTION_GET_STATUS);
     }
-    @Override protected void onPause() { super.onPause(); shakeDetector.stop(); }
-    @Override protected void onDestroy() {
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (shakeDetector != null) shakeDetector.stop();
+    }
+
+    @Override
+    protected void onDestroy() {
         super.onDestroy();
         try { unregisterReceiver(serviceUpdateReceiver); } catch (Exception ignored) {}
-        shakeDetector.stop();
+        executor.shutdown();
     }
 }

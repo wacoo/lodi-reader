@@ -31,7 +31,13 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 import androidx.media.session.MediaButtonReceiver;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ReadingService extends Service {
     private static final String TAG = "ReadingService";
@@ -40,6 +46,7 @@ public class ReadingService extends Service {
 
     public static final String ACTION_LOAD = "LODI_ACTION_LOAD";
     public static final String ACTION_PLAY = "LODI_ACTION_PLAY";
+    public static final String ACTION_PLAY_AT = "LODI_ACTION_PLAY_AT";
     public static final String ACTION_PAUSE = "LODI_ACTION_PAUSE";
     public static final String ACTION_REWIND = "LODI_ACTION_REWIND";
     public static final String ACTION_FORWARD = "LODI_ACTION_FORWARD";
@@ -54,26 +61,40 @@ public class ReadingService extends Service {
     private TTSPlayer ttsPlayer;
     private SettingsManager settings;
     private String currentBookUri;
+    private int currentChapterIndex = -1;
+    private int totalChapters = 0;
     private boolean wasPlayingBeforeCall = false;
-    private boolean isLoading = false;
-    private boolean playAfterLoadRequested = false;
     
+    private final Set<String> loadingChapters = Collections.synchronizedSet(new HashSet<>());
+    private String backgroundLoadingBookUri = null;
+
     private LodiStepTimer timerManager;
+    private ShakeDetector shakeDetector;
     private VolumeController volumeController;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService executor = Executors.newFixedThreadPool(2);
     private AudioFocusRequest audioFocusRequest;
+    private AppDatabase db;
 
     private final AudioManager.OnAudioFocusChangeListener focusChangeListener = focusChange -> {
         if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
             pausePlayback();
+        } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            // Gains focus
         }
     };
 
-    private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver audioReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
+            String action = intent.getAction();
+            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(action)) {
                 pausePlayback();
+            } else if ("android.media.VOLUME_CHANGED_ACTION".equals(action)) {
+                int streamType = intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1);
+                if (streamType == AudioManager.STREAM_MUSIC) {
+                    if (volumeController != null) volumeController.handlePossibleManualChange();
+                }
             }
         }
     };
@@ -82,9 +103,12 @@ public class ReadingService extends Service {
     public void onCreate() {
         super.onCreate();
         settings = new SettingsManager(this);
+        db = AppDatabase.getInstance(this);
         createNotificationChannel();
 
         volumeController = new VolumeController(this);
+        volumeController.captureInitialVolume();
+
         timerManager = new LodiStepTimer(volumeController, () -> {
             pausePlayback();
             sendBroadcast(new Intent(ACTION_CLOSE).setPackage(getPackageName()));
@@ -96,29 +120,75 @@ public class ReadingService extends Service {
             sendBroadcast(tickIntent);
         });
 
+        shakeDetector = new ShakeDetector(this, settings.getShakeIntensity(), () -> {
+            if (ttsPlayer != null && ttsPlayer.isPlaying() && settings.isTimerEnabled()) {
+                mainHandler.post(() -> {
+                    if (timerManager != null) timerManager.handleShake();
+                });
+            }
+        });
+
         ttsPlayer = new TTSPlayer(this, new TTSPlayer.OnTTSListener() {
             @Override
             public void onSentenceChanged(int index) {
                 updatePlaybackState(PlaybackStateCompat.STATE_PLAYING);
                 updateNotification();
-                if (currentBookUri != null) settings.setLastReadSentenceIndex(currentBookUri, index);
-                
-                // Broadcast updates with package name
-                sendBroadcast(new Intent(ACTION_PLAY).setPackage(getPackageName()));
-                
-                Intent intent = new Intent(ACTION_UPDATE_UI);
-                intent.putExtra("INDEX", index);
-                intent.putExtra("TOTAL", ttsPlayer.getSentences() != null ? ttsPlayer.getSentences().size() : 0);
-                intent.setPackage(getPackageName());
-                sendBroadcast(intent);
+                if (currentBookUri != null) {
+                    settings.setLastReadSentenceIndex(currentBookUri, index);
+                    settings.setLastReadChapterIndex(currentBookUri, currentChapterIndex);
+                }
+                sendUpdateUiBroadcast(index);
             }
             @Override
             public void onFinished() {
-                updatePlaybackState(PlaybackStateCompat.STATE_STOPPED);
-                pausePlayback();
+                loadNextChapter();
             }
         });
 
+        setupMediaSession();
+        
+        IntentFilter audioFilter = new IntentFilter();
+        audioFilter.addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+        audioFilter.addAction("android.media.VOLUME_CHANGED_ACTION");
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(audioReceiver, audioFilter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(audioReceiver, audioFilter);
+        }
+        
+        setupTelephonyListener();
+        startServiceForeground();
+
+        currentBookUri = settings.getLastOpenedBookUri();
+        if (currentBookUri != null) {
+            executor.execute(() -> {
+                try {
+                    List<ChapterEntity> chapters = db.bookDao().getChaptersForBook(currentBookUri);
+                    totalChapters = chapters.size();
+                    if (totalChapters > 0) {
+                        int lastChapter = settings.getLastReadChapterIndex(currentBookUri);
+                        int lastSentence = settings.getLastReadSentenceIndex(currentBookUri);
+                        mainHandler.post(() -> loadChapterAsync(currentBookUri, lastChapter, false, lastSentence));
+                    }
+                    startBackgroundLoading(currentBookUri);
+                } catch (Exception e) {
+                    Log.e(TAG, "Init load error", e);
+                }
+            });
+        }
+    }
+
+    private void sendUpdateUiBroadcast(int sentenceIndex) {
+        Intent intent = new Intent(ACTION_UPDATE_UI);
+        intent.putExtra("INDEX", sentenceIndex);
+        intent.putExtra("CHAPTER_INDEX", currentChapterIndex);
+        intent.putExtra("TOTAL_CHAPTERS", totalChapters);
+        intent.setPackage(getPackageName());
+        sendBroadcast(intent);
+    }
+
+    private void setupMediaSession() {
         ComponentName mbr = new ComponentName(this, MediaButtonReceiver.class);
         mediaSession = new MediaSessionCompat(this, "LodiReaderSession", mbr, null);
         mediaSession.setCallback(new MediaSessionCompat.Callback() {
@@ -143,28 +213,12 @@ public class ReadingService extends Service {
         }, mainHandler);
 
         mediaSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS | MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS);
-        Intent mediaButtonIntent = new Intent(Intent.ACTION_MEDIA_BUTTON);
-        mediaButtonIntent.setComponent(mbr);
-        int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_IMMUTABLE : 0;
-        PendingIntent pi = PendingIntent.getBroadcast(this, 0, mediaButtonIntent, piFlags);
-        mediaSession.setMediaButtonReceiver(pi);
-
         mediaSession.setActive(true);
-        updatePlaybackState(PlaybackStateCompat.STATE_PAUSED);
-        
-        registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
-        setupTelephonyListener();
-        startServiceForeground();
-
-        currentBookUri = settings.getLastOpenedBookUri();
-        if (currentBookUri != null) loadLastBookAsync(false);
     }
 
     private void startPlayback() {
         if (ttsPlayer == null) return;
         if (ttsPlayer.getSentences() == null || ttsPlayer.getSentences().isEmpty()) {
-            playAfterLoadRequested = true;
-            loadLastBookAsync(true);
             return;
         }
 
@@ -172,7 +226,10 @@ public class ReadingService extends Service {
         int result;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
-            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN).setAudioAttributes(attrs).setOnAudioFocusChangeListener(focusChangeListener).build();
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener(focusChangeListener)
+                    .build();
             result = am.requestAudioFocus(audioFocusRequest);
         } else {
             result = am.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
@@ -190,6 +247,7 @@ public class ReadingService extends Service {
                 timerManager.setFadeStartMs(settings.getFadeMs());
                 timerManager.start(settings.getTimerMs());
             }
+            shakeDetector.start();
         }
     }
 
@@ -201,59 +259,183 @@ public class ReadingService extends Service {
             sendBroadcast(new Intent(ACTION_PAUSE).setPackage(getPackageName()));
         }
         if (timerManager != null) timerManager.stop();
+        if (shakeDetector != null) shakeDetector.stop();
     }
 
-    private void forward() { if (ttsPlayer != null) { ttsPlayer.setCurrentIndex(ttsPlayer.getCurrentIndex() + 1); startPlayback(); } }
-    private void rewind() { if (ttsPlayer != null) { ttsPlayer.setCurrentIndex(Math.max(0, ttsPlayer.getCurrentIndex() - 1)); startPlayback(); } }
+    private void forward() {
+        if (ttsPlayer == null) return;
+        int next = ttsPlayer.getCurrentIndex() + 1;
+        if (next < ttsPlayer.getSentences().size()) {
+            ttsPlayer.setCurrentIndex(next);
+            startPlayback();
+        } else {
+            loadNextChapter();
+        }
+    }
 
-    private void loadLastBookAsync(boolean forcePlay) {
-        if (isLoading) { if (forcePlay) playAfterLoadRequested = true; return; }
-        currentBookUri = settings.getLastOpenedBookUri();
-        if (currentBookUri == null) return;
-        isLoading = true;
-        new Thread(() -> {
+    private void rewind() {
+        if (ttsPlayer == null) return;
+        int prev = ttsPlayer.getCurrentIndex() - 1;
+        if (prev >= 0) {
+            ttsPlayer.setCurrentIndex(prev);
+            startPlayback();
+        } else {
+            loadPreviousChapter();
+        }
+    }
+
+    private void loadNextChapter() {
+        if (currentBookUri != null && currentChapterIndex < totalChapters - 1) {
+            loadChapterAsync(currentBookUri, currentChapterIndex + 1, true, 0);
+        } else {
+            pausePlayback();
+        }
+    }
+
+    private void loadPreviousChapter() {
+        if (currentBookUri != null && currentChapterIndex > 0) {
+            loadChapterAsync(currentBookUri, currentChapterIndex - 1, true, -1);
+        }
+    }
+
+    private void loadChapterAsync(String uri, int chapterIndex, boolean playImmediately, int startSentenceIndex) {
+        String key = uri + "_" + chapterIndex;
+        if (loadingChapters.contains(key)) return;
+        loadingChapters.add(key);
+
+        executor.execute(() -> {
             try {
-                BookLoader.BookMetadata meta = new BookLoader().loadBookWithMetadata(this, Uri.parse(currentBookUri), null);
-                if (meta != null && meta.sentences != null && !meta.sentences.isEmpty()) {
-                    BookDataHolder.getInstance().replaceData(meta.sentences, meta.toc, meta.title, meta.author);
-                    ttsPlayer.loadSentences(meta.sentences);
-                    ttsPlayer.setCurrentIndex(settings.getLastReadSentenceIndex(currentBookUri));
-                    mediaSession.setMetadata(new MediaMetadataCompat.Builder().putString(MediaMetadataCompat.METADATA_KEY_TITLE, meta.title).putString(MediaMetadataCompat.METADATA_KEY_ARTIST, meta.author).build());
-                    if (forcePlay || playAfterLoadRequested) { playAfterLoadRequested = false; mainHandler.post(this::startPlayback); }
-                    updateNotification();
+                BookEntity book = db.bookDao().getBookByUri(uri);
+                if (book == null) return;
+
+                List<ChapterEntity> allChapters = db.bookDao().getChaptersForBook(uri);
+                totalChapters = allChapters.size();
+                
+                // Persist progress to DB for bookshelf immediately
+                db.runInTransaction(() -> {
+                    db.bookDao().updateProgress(uri, chapterIndex);
+                    db.bookDao().updateTotalPages(uri, totalChapters);
+                });
+
+                List<SentenceEntity> entities = db.bookDao().getSentencesForChapter(uri, chapterIndex);
+                List<Sentence> sentences = new ArrayList<>();
+                
+                if (entities.isEmpty()) {
+                    List<Sentence> loaded = new BookLoader().loadChapter(this, Uri.parse(uri), chapterIndex);
+                    if (loaded != null) {
+                        List<SentenceEntity> toSave = new ArrayList<>();
+                        for (int i = 0; i < loaded.size(); i++) {
+                            Sentence s = loaded.get(i);
+                            toSave.add(new SentenceEntity(uri, chapterIndex, i, s.text, s.link, s.internalId));
+                        }
+                        db.runInTransaction(() -> {
+                            db.bookDao().deleteSentencesForChapter(uri, chapterIndex);
+                            db.bookDao().insertSentences(toSave);
+                            db.bookDao().updateChapterLoadStatus(uri, chapterIndex, true, loaded.size());
+                        });
+                        sentences.addAll(loaded);
+                    }
+                } else {
+                    for (SentenceEntity e : entities) {
+                        sentences.add(new Sentence(e.globalIndex, e.text, e.link, e.internalId));
+                    }
                 }
-            } catch (Exception e) { Log.e(TAG, "Load error", e); } finally { isLoading = false; }
-        }).start();
+
+                if (!sentences.isEmpty()) {
+                    mainHandler.post(() -> {
+                        currentBookUri = uri;
+                        currentChapterIndex = chapterIndex;
+                        ttsPlayer.loadSentences(sentences);
+                        int finalIdx = startSentenceIndex;
+                        if (finalIdx == -1) finalIdx = sentences.size() - 1;
+                        if (finalIdx >= sentences.size()) finalIdx = 0;
+                        ttsPlayer.setCurrentIndex(finalIdx);
+                        
+                        mediaSession.setMetadata(new MediaMetadataCompat.Builder()
+                                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, book.title)
+                                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, book.author)
+                                .build());
+                        
+                        if (playImmediately) startPlayback();
+                        updateNotification();
+                        sendUpdateUiBroadcast(finalIdx);
+                    });
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Load chapter error", e);
+            } finally {
+                loadingChapters.remove(key);
+            }
+        });
+    }
+
+    private void startBackgroundLoading(String uri) {
+        if (uri == null || uri.equals(backgroundLoadingBookUri)) return;
+        backgroundLoadingBookUri = uri;
+
+        executor.execute(() -> {
+            try {
+                List<ChapterEntity> chapters = db.bookDao().getChaptersForBook(uri);
+                for (ChapterEntity chapter : chapters) {
+                    if (!uri.equals(backgroundLoadingBookUri)) break;
+                    
+                    if (!chapter.isLoaded) {
+                        String key = uri + "_" + chapter.index;
+                        if (loadingChapters.contains(key)) continue;
+                        loadingChapters.add(key);
+                        
+                        try {
+                            List<Sentence> loaded = new BookLoader().loadChapter(this, Uri.parse(uri), chapter.index);
+                            if (loaded != null) {
+                                List<SentenceEntity> toSave = new ArrayList<>();
+                                for (int i = 0; i < loaded.size(); i++) {
+                                    Sentence s = loaded.get(i);
+                                    toSave.add(new SentenceEntity(uri, chapter.index, i, s.text, s.link, s.internalId));
+                                }
+                                db.runInTransaction(() -> {
+                                    db.bookDao().deleteSentencesForChapter(uri, chapter.index);
+                                    db.bookDao().insertSentences(toSave);
+                                    db.bookDao().updateChapterLoadStatus(uri, chapter.index, true, loaded.size());
+                                });
+                            }
+                        } finally {
+                            loadingChapters.remove(key);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Background loading error", e);
+            } finally {
+                if (uri.equals(backgroundLoadingBookUri)) backgroundLoadingBookUri = null;
+            }
+        });
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
             String action = intent.getAction();
-            if (Intent.ACTION_MEDIA_BUTTON.equals(action)) { MediaButtonReceiver.handleIntent(mediaSession, intent); return START_STICKY; }
-            if (ACTION_LOAD.equals(action)) {
-                List<Sentence> sentences = BookDataHolder.getInstance().getSentences();
-                if (sentences != null && !sentences.isEmpty()) {
-                    ttsPlayer.loadSentences(sentences);
-                    currentBookUri = settings.getLastOpenedBookUri();
-                    mediaSession.setMetadata(new MediaMetadataCompat.Builder().putString(MediaMetadataCompat.METADATA_KEY_TITLE, BookDataHolder.getInstance().getTitle()).putString(MediaMetadataCompat.METADATA_KEY_ARTIST, BookDataHolder.getInstance().getAuthor()).build());
-                } else loadLastBookAsync(false);
+            if (Intent.ACTION_MEDIA_BUTTON.equals(action)) {
+                MediaButtonReceiver.handleIntent(mediaSession, intent);
+                return START_STICKY;
             }
-            if (intent.hasExtra("INDEX")) {
+            if (ACTION_LOAD.equals(action)) {
+                String uri = intent.getStringExtra("URI");
+                int chapter = intent.getIntExtra("CHAPTER_INDEX", 0);
+                int sentence = intent.getIntExtra("SENTENCE_INDEX", 0);
+                if (uri != null) {
+                    loadChapterAsync(uri, chapter, true, sentence);
+                    startBackgroundLoading(uri);
+                }
+            }
+            else if (ACTION_PLAY.equals(action)) startPlayback();
+            else if (ACTION_PLAY_AT.equals(action)) {
                 int index = intent.getIntExtra("INDEX", 0);
                 if (ttsPlayer != null) {
                     ttsPlayer.setCurrentIndex(index);
-                    if (ttsPlayer.isPlaying()) startPlayback();
-                    else {
-                        Intent updateIntent = new Intent(ACTION_UPDATE_UI);
-                        updateIntent.putExtra("INDEX", index);
-                        updateIntent.putExtra("TOTAL", ttsPlayer.getSentences() != null ? ttsPlayer.getSentences().size() : 0);
-                        updateIntent.setPackage(getPackageName());
-                        sendBroadcast(updateIntent);
-                    }
+                    startPlayback();
                 }
             }
-            if (ACTION_PLAY.equals(action)) startPlayback();
             else if (ACTION_PAUSE.equals(action)) pausePlayback();
             else if (ACTION_FORWARD.equals(action)) forward();
             else if (ACTION_REWIND.equals(action)) rewind();
@@ -264,8 +446,10 @@ public class ReadingService extends Service {
                         timerManager.setResetTimeMs(settings.getTimerMs());
                         timerManager.setFadeStartMs(settings.getFadeMs());
                         timerManager.start(settings.getTimerMs());
+                        shakeDetector.start();
                     } else {
                         timerManager.stop();
+                        shakeDetector.stop();
                     }
                 }
             }
@@ -279,11 +463,7 @@ public class ReadingService extends Service {
                     sendBroadcast(tickIntent);
                 }
                 if (ttsPlayer != null) {
-                    Intent updateIntent = new Intent(ACTION_UPDATE_UI);
-                    updateIntent.putExtra("INDEX", ttsPlayer.getCurrentIndex());
-                    updateIntent.putExtra("TOTAL", ttsPlayer.getSentences() != null ? ttsPlayer.getSentences().size() : 0);
-                    updateIntent.setPackage(getPackageName());
-                    sendBroadcast(updateIntent);
+                    sendUpdateUiBroadcast(ttsPlayer.getCurrentIndex());
                 }
             }
             else if (ACTION_CLOSE.equals(action)) {
@@ -298,13 +478,18 @@ public class ReadingService extends Service {
 
     private void startServiceForeground() {
         Notification notification = buildNotification();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) 
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         else startForeground(NOTIF_ID, notification);
     }
 
     private void updatePlaybackState(int state) {
-        long actions = PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP;
-        mediaSession.setPlaybackState(new PlaybackStateCompat.Builder().setActions(actions).setState(state, ttsPlayer != null ? ttsPlayer.getCurrentIndex() : 0, 1.0f).build());
+        long actions = PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_PLAY_PAUSE | 
+                       PlaybackStateCompat.ACTION_SKIP_TO_NEXT | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP;
+        mediaSession.setPlaybackState(new PlaybackStateCompat.Builder()
+                .setActions(actions)
+                .setState(state, ttsPlayer != null ? ttsPlayer.getCurrentIndex() : 0, 1.0f)
+                .build());
     }
 
     private void updateNotification() {
@@ -320,13 +505,15 @@ public class ReadingService extends Service {
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentTitle(BookDataHolder.getInstance().getTitle())
+                .setContentTitle(mediaSession.getController().getMetadata() != null ? mediaSession.getController().getMetadata().getDescription().getTitle() : "Lodi Reader")
                 .setContentText(isPlaying ? "Reading..." : "Paused")
                 .setContentIntent(pMain)
                 .setOngoing(isPlaying)
                 .setSilent(true)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setStyle(new androidx.media.app.NotificationCompat.MediaStyle().setMediaSession(mediaSession.getSessionToken()).setShowActionsInCompactView(1, 2, 3))
+                .setStyle(new androidx.media.app.NotificationCompat.MediaStyle()
+                        .setMediaSession(mediaSession.getSessionToken())
+                        .setShowActionsInCompactView(1, 2, 3))
                 .addAction(android.R.drawable.ic_media_rew, "Rewind", PendingIntent.getService(this, 1, new Intent(this, ReadingService.class).setAction(ACTION_REWIND), piFlags))
                 .addAction(isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play, isPlaying ? "Pause" : "Play", PendingIntent.getService(this, 2, new Intent(this, ReadingService.class).setAction(isPlaying ? ACTION_PAUSE : ACTION_PLAY), piFlags))
                 .addAction(android.R.drawable.ic_media_ff, "Forward", PendingIntent.getService(this, 3, new Intent(this, ReadingService.class).setAction(ACTION_FORWARD), piFlags))
@@ -348,13 +535,23 @@ public class ReadingService extends Service {
         if (tm != null) {
             tm.listen(new PhoneStateListener() {
                 @Override public void onCallStateChanged(int state, String phoneNumber) {
-                    if (state == TelephonyManager.CALL_STATE_RINGING || state == TelephonyManager.CALL_STATE_OFFHOOK) { if (ttsPlayer != null && ttsPlayer.isPlaying()) { wasPlayingBeforeCall = true; pausePlayback(); } }
-                    else if (state == TelephonyManager.CALL_STATE_IDLE) { if (wasPlayingBeforeCall) { wasPlayingBeforeCall = false; startPlayback(); } }
+                    if (state == TelephonyManager.CALL_STATE_RINGING || state == TelephonyManager.CALL_STATE_OFFHOOK) { 
+                        if (ttsPlayer != null && ttsPlayer.isPlaying()) { wasPlayingBeforeCall = true; pausePlayback(); } 
+                    } else if (state == TelephonyManager.CALL_STATE_IDLE) { 
+                        if (wasPlayingBeforeCall) { wasPlayingBeforeCall = false; startPlayback(); } 
+                    }
                 }
             }, PhoneStateListener.LISTEN_CALL_STATE);
         }
     }
 
-    @Override public void onDestroy() { if (ttsPlayer != null) ttsPlayer.release(); if (mediaSession != null) { mediaSession.setActive(false); mediaSession.release(); } try { unregisterReceiver(noisyReceiver); } catch (Exception ignored) {} super.onDestroy(); }
+    @Override public void onDestroy() { 
+        if (ttsPlayer != null) ttsPlayer.release(); 
+        if (mediaSession != null) { mediaSession.setActive(false); mediaSession.release(); } 
+        try { unregisterReceiver(audioReceiver); } catch (Exception ignored) {} 
+        if (shakeDetector != null) shakeDetector.stop();
+        executor.shutdown();
+        super.onDestroy(); 
+    }
     @Nullable @Override public IBinder onBind(Intent intent) { return null; }
 }

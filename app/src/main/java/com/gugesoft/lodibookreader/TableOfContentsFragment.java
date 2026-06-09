@@ -15,16 +15,14 @@ import java.util.List;
 
 public class TableOfContentsFragment extends Fragment {
     private List<BookLoader.TOCItem> tocItems;
-    private List<Sentence> allSentences;
     private OnTOCClickListener listener;
 
     public interface OnTOCClickListener {
-        void onSentenceSelected(int index);
+        void onChapterSelected(int chapterIndex);
     }
 
-    public TableOfContentsFragment(List<BookLoader.TOCItem> tocItems, List<Sentence> allSentences, OnTOCClickListener listener) {
+    public TableOfContentsFragment(List<BookLoader.TOCItem> tocItems, OnTOCClickListener listener) {
         this.tocItems = tocItems;
-        this.allSentences = allSentences;
         this.listener = listener;
     }
 
@@ -39,34 +37,9 @@ public class TableOfContentsFragment extends Fragment {
         
         recyclerView.setAdapter(new TOCAdapter(tocItems, item -> {
             if (listener != null) {
-                int index = findSentenceIndex(item.href);
-                if (index != -1) {
-                    listener.onSentenceSelected(index);
-                }
+                listener.onChapterSelected(item.chapterIndex);
             }
         }));
         return view;
-    }
-
-    private int findSentenceIndex(String href) {
-        if (allSentences == null || href == null) return -1;
-        
-        // Exact match
-        for (int i = 0; i < allSentences.size(); i++) {
-            Sentence s = allSentences.get(i);
-            if (href.equals(s.getInternalId())) {
-                return i;
-            }
-        }
-        
-        // Match resource only (if href is just the file name but sentence has file#id)
-        for (int i = 0; i < allSentences.size(); i++) {
-            Sentence s = allSentences.get(i);
-            String sId = s.getInternalId();
-            if (sId != null && sId.startsWith(href)) {
-                return i;
-            }
-        }
-        return -1;
     }
 }

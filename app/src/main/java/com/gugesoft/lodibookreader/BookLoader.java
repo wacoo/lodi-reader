@@ -29,6 +29,7 @@ import nl.siegmann.epublib.domain.TableOfContents;
 import nl.siegmann.epublib.epub.EpubReader;
 
 public class BookLoader {
+    private static final String TAG = "BookLoader";
 
     public interface OnProgressListener {
         void onProgress(int current, int total, String message);
@@ -37,44 +38,101 @@ public class BookLoader {
     public static class TOCItem {
         public final String title;
         public final String href;
+        public final int chapterIndex;
 
-        public TOCItem(String title, String href) {
+        public TOCItem(String title, String href, int chapterIndex) {
             this.title = title;
             this.href = href;
+            this.chapterIndex = chapterIndex;
         }
     }
 
-    public static class BookMetadata {
+    public static class BookInfo {
         public final String title;
         public final String author;
         public final String coverUri;
-        public final List<Sentence> sentences;
         public final List<TOCItem> toc;
+        public final int totalChapters;
 
-        public BookMetadata(String title, String author, String coverUri, List<Sentence> sentences, List<TOCItem> toc) {
+        public BookInfo(String title, String author, String coverUri, List<TOCItem> toc, int totalChapters) {
             this.title = title != null && !title.isEmpty() ? title : "Unknown Book";
             this.author = author != null ? author : "";
             this.coverUri = coverUri;
-            this.sentences = sentences != null ? sentences : new ArrayList<>();
             this.toc = toc != null ? toc : new ArrayList<>();
+            this.totalChapters = totalChapters;
         }
     }
 
-    public BookMetadata loadBookWithMetadata(Context context, Uri uri, OnProgressListener listener) {
+    public BookInfo extractBookInfo(Context context, Uri uri) {
         String mimeType = context.getContentResolver().getType(uri);
-
         try (InputStream is = context.getContentResolver().openInputStream(uri)) {
-            if (is == null) return new BookMetadata("Error Opening", "", null, null, null);
+            if (is == null) return null;
 
             if ("text/plain".equals(mimeType) || (uri.getPath() != null && uri.getPath().toLowerCase().endsWith(".txt"))) {
-                if (listener != null) listener.onProgress(0, 1, "Loading text file...");
-                return new BookMetadata("TXT Book", "", null, loadTxt(is), null);
+                List<TOCItem> toc = new ArrayList<>();
+                toc.add(new TOCItem("Contents", uri.toString(), 0));
+                return new BookInfo("TXT Book", "", null, toc, 1);
             } else {
-                return loadEpubWithMetadata(context, is, listener);
+                Book book = new EpubReader().readEpub(is);
+                String title = book.getMetadata().getFirstTitle();
+                String author = book.getMetadata().getAuthors().isEmpty() ? "" : book.getMetadata().getAuthors().get(0).toString();
+                
+                String coverUri = null;
+                Resource coverRes = book.getCoverImage();
+                if (coverRes != null) {
+                    try {
+                        Bitmap bmp = BitmapFactory.decodeStream(coverRes.getInputStream());
+                        if (bmp != null) coverUri = saveCoverToCache(context, bmp, title);
+                    } catch (Exception ignored) {}
+                }
+
+                List<SpineReference> spine = book.getSpine().getSpineReferences();
+                List<TOCItem> allChapters = new ArrayList<>();
+                for (int i = 0; i < spine.size(); i++) {
+                    allChapters.add(new TOCItem("Chapter " + (i + 1), spine.get(i).getResource().getHref(), i));
+                }
+
+                List<TOCItem> tocItems = new ArrayList<>();
+                extractTOC(book.getTableOfContents(), tocItems, spine);
+                
+                // Map TOC titles to spine chapters
+                for (TOCItem toc : tocItems) {
+                    if (toc.chapterIndex >= 0 && toc.chapterIndex < allChapters.size()) {
+                        // Update with better title if available
+                        TOCItem original = allChapters.get(toc.chapterIndex);
+                        if (original.title.startsWith("Chapter ")) {
+                             allChapters.set(toc.chapterIndex, toc);
+                        }
+                    }
+                }
+
+                return new BookInfo(title, author, coverUri, allChapters, spine.size());
             }
         } catch (Exception e) {
-            Log.e("BookLoader", "Load error", e);
-            return new BookMetadata("Error", "", null, null, null);
+            Log.e(TAG, "Error extracting book info", e);
+            return null;
+        }
+    }
+
+    public List<Sentence> loadChapter(Context context, Uri uri, int chapterIndex) {
+        String mimeType = context.getContentResolver().getType(uri);
+        try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+            if (is == null) return null;
+
+            if ("text/plain".equals(mimeType) || (uri.getPath() != null && uri.getPath().toLowerCase().endsWith(".txt"))) {
+                return loadTxt(is);
+            } else {
+                Book book = new EpubReader().readEpub(is);
+                List<SpineReference> spine = book.getSpine().getSpineReferences();
+                if (chapterIndex < 0 || chapterIndex >= spine.size()) return null;
+
+                Resource resource = spine.get(chapterIndex).getResource();
+                String html = readResource(resource);
+                return processHtmlIntoSentences(html, resource.getHref(), 0);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error loading chapter " + chapterIndex, e);
+            return null;
         }
     }
 
@@ -85,78 +143,33 @@ public class BookLoader {
             String line;
             while ((line = br.readLine()) != null) sb.append(line).append(" ");
             sentences.addAll(splitIntoSentences(sb.toString(), null));
-        } catch (Exception e) { Log.e("BookLoader", "TXT error", e); }
+        } catch (Exception e) { Log.e(TAG, "TXT error", e); }
         return sentences;
     }
 
-    private BookMetadata loadEpubWithMetadata(Context context, InputStream is, OnProgressListener listener) {
-        List<Sentence> allSentences = new ArrayList<>();
-        List<TOCItem> tocItems = new ArrayList<>();
-        String title = "Unknown Book";
-        String author = "";
-        String coverUri = null;
-
-        try {
-            if (listener != null) listener.onProgress(0, 100, "Reading EPUB structure...");
-            Book book = new EpubReader().readEpub(is);
-            if (!book.getMetadata().getTitles().isEmpty()) title = book.getMetadata().getTitles().get(0);
-            if (!book.getMetadata().getAuthors().isEmpty()) author = book.getMetadata().getAuthors().get(0).toString();
-
-            // TOC
-            extractTOC(book.getTableOfContents(), tocItems);
-
-            // Cover
-            Resource coverRes = book.getCoverImage();
-            if (coverRes == null) {
-                for (Resource res : book.getResources().getAll()) {
-                    String href = res.getHref().toLowerCase();
-                    if ((href.contains("cover") || href.contains("front")) && 
-                        (href.endsWith(".jpg") || href.endsWith(".jpeg") || href.endsWith(".png") || href.endsWith(".webp"))) {
-                        coverRes = res;
-                        break;
-                    }
-                }
-            }
-            if (coverRes != null) {
-                Bitmap bmp = BitmapFactory.decodeStream(coverRes.getInputStream());
-                if (bmp != null) coverUri = saveCoverToCache(context, bmp, title);
-            }
-
-            List<SpineReference> spineReferences = book.getSpine().getSpineReferences();
-            int totalChapters = spineReferences.size();
-            
-            for (int i = 0; i < totalChapters; i++) {
-                SpineReference spine = spineReferences.get(i);
-                Resource resource = spine.getResource();
-                String resourceHref = resource.getHref();
-                
-                if (listener != null) {
-                    listener.onProgress(i, totalChapters, "Processing chapter " + (i + 1) + " of " + totalChapters);
-                }
-                
-                String html = readResource(resource);
-                allSentences.addAll(processHtmlIntoSentences(html, resourceHref, allSentences.size()));
-            }
-
-        } catch (Exception e) { Log.e("BookLoader", "EPUB error", e); }
-
-        return new BookMetadata(title, author, coverUri, allSentences, tocItems);
-    }
-
-    private void extractTOC(TableOfContents toc, List<TOCItem> items) {
+    private void extractTOC(TableOfContents toc, List<TOCItem> items, List<SpineReference> spine) {
         if (toc == null || toc.getTocReferences() == null) return;
         for (TOCReference ref : toc.getTocReferences()) {
-            flattenTOC(ref, items);
+            flattenTOC(ref, items, spine);
         }
     }
 
-    private void flattenTOC(TOCReference ref, List<TOCItem> items) {
-        items.add(new TOCItem(ref.getTitle(), ref.getCompleteHref()));
+    private void flattenTOC(TOCReference ref, List<TOCItem> items, List<SpineReference> spine) {
+        int chapterIdx = findChapterIndex(ref.getResource(), spine);
+        items.add(new TOCItem(ref.getTitle(), ref.getCompleteHref(), chapterIdx));
         if (ref.getChildren() != null) {
             for (TOCReference child : ref.getChildren()) {
-                flattenTOC(child, items);
+                flattenTOC(child, items, spine);
             }
         }
+    }
+
+    private int findChapterIndex(Resource res, List<SpineReference> spine) {
+        if (res == null) return -1;
+        for (int i = 0; i < spine.size(); i++) {
+            if (spine.get(i).getResource().getHref().equals(res.getHref())) return i;
+        }
+        return -1;
     }
 
     private String readResource(Resource res) {
@@ -170,8 +183,6 @@ public class BookLoader {
 
     private List<Sentence> processHtmlIntoSentences(String html, String resourceHref, int startId) {
         List<Sentence> result = new ArrayList<>();
-        
-        // Mark anchors so they survive tag stripping
         String markedHtml = html.replaceAll("(?i)<[^>]+id=\"([^\"]+)\"[^>]*>", "$0 [IDMARKER:$1] ");
         markedHtml = markedHtml.replaceAll("(?i)<[^>]+name=\"([^\"]+)\"[^>]*>", "$0 [IDMARKER:$1] ");
 
